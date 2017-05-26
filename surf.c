@@ -5,6 +5,7 @@
 #include <sys/file.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <glib.h>
 #include <libgen.h>
 #include <limits.h>
 #include <pwd.h>
@@ -22,6 +23,7 @@
 #include <glib/gstdio.h>
 #include <gtk/gtk.h>
 #include <gtk/gtkx.h>
+#include <gcr/gcr.h>
 #include <JavaScriptCore/JavaScript.h>
 #include <webkit2/webkit2.h>
 #include <X11/X.h>
@@ -60,14 +62,17 @@ enum {
 typedef enum {
 	AcceleratedCanvas,
 	CaretBrowsing,
+	Certificate,
 	CookiePolicies,
 	DiskCache,
+	DefaultCharset,
 	DNSPrefetch,
 	FontSize,
 	FrameFlattening,
 	Geolocation,
 	HideBackground,
 	Inspector,
+	Java,
 	JavaScript,
 	KioskMode,
 	LoadImages,
@@ -78,9 +83,10 @@ typedef enum {
 	ScrollBars,
 	ShowIndicators,
 	SiteQuirks,
+	SmoothScrolling,
 	SpellChecking,
 	SpellLanguages,
-	StrictSSL,
+	StrictTLS,
 	Style,
 	ZoomLevel,
 	ParameterLast,
@@ -104,9 +110,10 @@ typedef struct Client {
 	WebKitWebInspector *inspector;
 	WebKitFindController *finder;
 	WebKitHitTestResult *mousepos;
-	GTlsCertificateFlags tlsflags;
+	GTlsCertificate *cert, *failedcert;
+	GTlsCertificateFlags tlserr;
 	Window xid;
-	int progress, fullscreen;
+	int progress, fullscreen, https, insecure, errorpage;
 	const char *title, *overtitle, *targeturi;
 	const char *needle;
 	struct Client *next;
@@ -136,9 +143,9 @@ typedef struct {
 
 typedef struct {
 	char *regex;
-	char *style;
+	char *file;
 	regex_t re;
-} SiteStyle;
+} SiteSpecific;
 
 /* Surf */
 static void usage(void);
@@ -162,8 +169,10 @@ static WebKitCookieAcceptPolicy cookiepolicy_get(void);
 static char cookiepolicy_set(const WebKitCookieAcceptPolicy p);
 static void seturiparameters(Client *c, const char *uri);
 static void setparameter(Client *c, int refresh, ParamName p, const Arg *a);
+static const char *getcert(const char *uri);
+static void setcert(Client *c, const char *file);
 static const char *getstyle(const char *uri);
-static void setstyle(Client *c, const char *stylefile);
+static void setstyle(Client *c, const char *file);
 static void runscript(Client *c);
 static void evalscript(Client *c, const char *jsstr, ...);
 static void updatewinid(Client *c);
@@ -184,6 +193,9 @@ static GdkFilterReturn processx(GdkXEvent *xevent, GdkEvent *event,
 static gboolean winevent(GtkWidget *w, GdkEvent *e, Client *c);
 static void showview(WebKitWebView *v, Client *c);
 static GtkWidget *createwindow(Client *c);
+static gboolean loadfailedtls(WebKitWebView *v, gchar *uri,
+                              GTlsCertificate *cert,
+                              GTlsCertificateFlags err, Client *c);
 static void loadchanged(WebKitWebView *v, WebKitLoadEvent e, Client *c);
 static void progresschanged(WebKitWebView *v, GParamSpec *ps, Client *c);
 static void titlechanged(WebKitWebView *view, GParamSpec *ps, Client *c);
@@ -196,6 +208,8 @@ static gboolean decidepolicy(WebKitWebView *v, WebKitPolicyDecision *d,
 static void decidenavigation(WebKitPolicyDecision *d, Client *c);
 static void decidenewwindow(WebKitPolicyDecision *d, Client *c);
 static void decideresource(WebKitPolicyDecision *d, Client *c);
+static void insecurecontent(WebKitWebView *v, WebKitInsecureContentEvent e,
+                            Client *c);
 static void downloadstarted(WebKitWebContext *wc, WebKitDownload *d,
                             Client *c);
 static void responsereceived(WebKitDownload *d, GParamSpec *ps, Client *c);
@@ -207,6 +221,7 @@ static void destroywin(GtkWidget* w, Client *c);
 static void pasteuri(GtkClipboard *clipboard, const char *text, gpointer d);
 static void reload(Client *c, const Arg *a);
 static void print(Client *c, const Arg *a);
+static void showcert(Client *c, const Arg *a);
 static void clipboard(Client *c, const Arg *a);
 static void zoom(Client *c, const Arg *a);
 static void scroll(Client *c, const Arg *a);
@@ -224,7 +239,7 @@ static void clicknewwindow(Client *c, const Arg *a, WebKitHitTestResult *h);
 static void clickexternplayer(Client *c, const Arg *a, WebKitHitTestResult *h);
 
 static char winid[64];
-static char togglestats[10];
+static char togglestats[12];
 static char pagestats[2];
 static Atom atoms[AtomLast];
 static Window embed;
@@ -244,9 +259,9 @@ char *argv0;
 void
 usage(void)
 {
-	die("usage: %s [-bBdDfFgGiIkKmMnNpPsSvx] [-a cookiepolicies ] "
-	    "[-c cookiefile] [-e xid] [-r scriptfile] [-t stylefile] "
-	    "[-u useragent] [-z zoomlevel] [uri]\n", basename(argv0));
+	die("usage: surf [-bBdDfFgGiIkKmMnNpPsStTvwxX]\n"
+	    "[-a cookiepolicies ] [-c cookiefile] [-C stylefile] [-e xid]\n"
+	    "[-r scriptfile] [-u useragent] [-z zoomlevel] [uri]\n");
 }
 
 void
@@ -287,23 +302,36 @@ setup(void)
 
 	/* dirs and files */
 	cookiefile = buildfile(cookiefile);
+	historyfile = buildfile(historyfile);
 	scriptfile = buildfile(scriptfile);
 	cachedir   = buildpath(cachedir);
+	certdir    = buildpath(certdir);
 
 	gdkkb = gdk_seat_get_keyboard(gdk_display_get_default_seat(gdpy));
+
+	for (i = 0; i < LENGTH(certs); ++i) {
+		if (!regcomp(&(certs[i].re), certs[i].regex, REG_EXTENDED)) {
+			certs[i].file = g_strconcat(certdir, "/", certs[i].file,
+			                            NULL);
+		} else {
+			fprintf(stderr, "Could not compile regex: %s\n",
+			        certs[i].regex);
+			certs[i].regex = NULL;
+		}
+	}
 
 	if (!stylefile) {
 		styledir = buildpath(styledir);
 		for (i = 0; i < LENGTH(styles); ++i) {
-			if (regcomp(&(styles[i].re), styles[i].regex,
+			if (!regcomp(&(styles[i].re), styles[i].regex,
 			    REG_EXTENDED)) {
-				fprintf(stderr,
-				        "Could not compile regex: %s\n",
+				styles[i].file = g_strconcat(styledir, "/",
+				                    styles[i].file, NULL);
+			} else {
+				fprintf(stderr, "Could not compile regex: %s\n",
 				        styles[i].regex);
 				styles[i].regex = NULL;
 			}
-			styles[i].style = g_strconcat(styledir, "/",
-			                              styles[i].style, NULL);
 		}
 		g_free(styledir);
 	} else {
@@ -321,8 +349,7 @@ setup(void)
 					uriparams[i].config[j] = defconfig[j];
 			}
 		} else {
-			fprintf(stderr,
-			        "Could not compile regex: %s\n",
+			fprintf(stderr, "Could not compile regex: %s\n",
 			        uriparams[i].uri);
 			uriparams[i].uri = NULL;
 		}
@@ -452,7 +479,6 @@ newclient(Client *rc)
 	clients = c;
 
 	c->progress = 100;
-	c->tlsflags = G_TLS_CERTIFICATE_VALIDATE_ALL + 1;
 	c->view = newview(c, rc ? rc->view : NULL);
 
 	return c;
@@ -485,8 +511,8 @@ loaduri(Client *c, const Arg *a)
 	if (strcmp(url, geturi(c)) == 0) {
 		reload(c, a);
 	} else {
-		webkit_web_view_load_uri(c->view, url);
-		updatetitle(c);
+	  webkit_web_view_load_uri(c->view, url);
+	  updatetitle(c);
 	}
 
 	g_free(url);
@@ -496,7 +522,6 @@ const char *
 geturi(Client *c)
 {
 	const char *uri;
-
 	if (!(uri = webkit_web_view_get_uri(c->view)))
 		uri = "about:blank";
 	return uri;
@@ -505,10 +530,10 @@ geturi(Client *c)
 void
 setatom(Client *c, int a, const char *v)
 {
-	XSync(dpy, False);
 	XChangeProperty(dpy, c->xid,
 	                atoms[a], XA_STRING, 8, PropModeReplace,
 	                (unsigned char *)v, strlen(v) + 1);
+	XSync(dpy, False);
 }
 
 const char *
@@ -520,6 +545,7 @@ getatom(Client *c, int a)
 	unsigned long ldummy;
 	unsigned char *p = NULL;
 
+	XSync(dpy, False);
 	XGetWindowProperty(dpy, c->xid, atoms[a], 0L, BUFSIZ, False, XA_STRING,
 	                   &adummy, &idummy, &ldummy, &ldummy, &p);
 	if (p)
@@ -534,7 +560,7 @@ getatom(Client *c, int a)
 void
 updatetitle(Client *c)
 {
-	char *title;
+  char *title;
 	const char *name = c->overtitle ? c->overtitle :
 	                   c->title ? c->title : "";
 
@@ -568,14 +594,18 @@ gettogglestats(Client *c)
 	togglestats[6] = curconfig[Plugins].val.b ?         'V' : 'v';
 	togglestats[7] = curconfig[Style].val.b ?           'M' : 'm';
 	togglestats[8] = curconfig[FrameFlattening].val.b ? 'F' : 'f';
-	togglestats[9] = '\0';
+	togglestats[9] = curconfig[Certificate].val.b ?     'X' : 'x';
+	togglestats[10] = curconfig[StrictTLS].val.b ?      'T' : 't';
+	togglestats[11] = '\0';
 }
 
 void
 getpagestats(Client *c)
 {
-	pagestats[0] = c->tlsflags > G_TLS_CERTIFICATE_VALIDATE_ALL ? '-' :
-	               c->tlsflags > 0 ? 'U' : 'T';
+	if (c->https)
+		pagestats[0] = (c->tlserr || c->insecure) ?  'U' : 'T';
+	else
+		pagestats[0] = '-';
 	pagestats[1] = '\0';
 }
 
@@ -610,18 +640,32 @@ cookiepolicy_set(const WebKitCookieAcceptPolicy p)
 void
 seturiparameters(Client *c, const char *uri)
 {
+	Parameter *newconfig = NULL;
 	int i;
 
 	for (i = 0; i < LENGTH(uriparams); ++i) {
 		if (uriparams[i].uri &&
 		    !regexec(&(uriparams[i].re), uri, 0, NULL, 0)) {
-			curconfig = uriparams[i].config;
+			newconfig = uriparams[i].config;
 			break;
 		}
 	}
 
-	for (i = 0; i < ParameterLast; ++i)
-		setparameter(c, 0, i, &curconfig[i].val);
+	if (!newconfig)
+		newconfig = defconfig;
+	if (newconfig == curconfig)
+		return;
+
+	for (i = 0; i < ParameterLast; ++i) {
+		if (defconfig[i].force)
+			continue;
+		if (newconfig[i].force)
+			setparameter(c, 0, i, &newconfig[i].val);
+		else if (curconfig[i].force)
+			setparameter(c, 0, i, &defconfig[i].val);
+	}
+
+	curconfig = newconfig;
 }
 
 void
@@ -638,6 +682,10 @@ setparameter(Client *c, int refresh, ParamName p, const Arg *a)
 		webkit_settings_set_enable_caret_browsing(s, a->b);
 		refresh = 0;
 		break;
+	case Certificate:
+		if (a->b)
+			setcert(c, geturi(c));
+		return; /* do not update */
 	case CookiePolicies:
 		webkit_cookie_manager_set_accept_policy(
 		    webkit_web_context_get_cookie_manager(
@@ -650,6 +698,9 @@ setparameter(Client *c, int refresh, ParamName p, const Arg *a)
 		    webkit_web_view_get_context(c->view), a->b ?
 		    WEBKIT_CACHE_MODEL_WEB_BROWSER :
 		    WEBKIT_CACHE_MODEL_DOCUMENT_VIEWER);
+		return; /* do not update */
+	case DefaultCharset:
+		webkit_settings_set_default_charset(s, a->v);
 		return; /* do not update */
 	case DNSPrefetch:
 		webkit_settings_set_enable_dns_prefetching(s, a->b);
@@ -669,6 +720,9 @@ setparameter(Client *c, int refresh, ParamName p, const Arg *a)
 		return; /* do not update */
 	case Inspector:
 		webkit_settings_set_enable_developer_extras(s, a->b);
+		return; /* do not update */
+	case Java:
+		webkit_settings_set_enable_java(s, a->b);
 		return; /* do not update */
 	case JavaScript:
 		webkit_settings_set_enable_javascript(s, a->b);
@@ -698,6 +752,9 @@ setparameter(Client *c, int refresh, ParamName p, const Arg *a)
 		return; /* do not update */
 	case ShowIndicators:
 		break;
+	case SmoothScrolling:
+		webkit_settings_set_enable_smooth_scrolling(s, a->b);
+		return; /* do not update */
 	case SiteQuirks:
 		webkit_settings_set_enable_site_specific_quirks(s, a->b);
 		break;
@@ -707,12 +764,12 @@ setparameter(Client *c, int refresh, ParamName p, const Arg *a)
 		return; /* do not update */
 	case SpellLanguages:
 		return; /* do nothing */
-	case StrictSSL:
+	case StrictTLS:
 		webkit_web_context_set_tls_errors_policy(
 		    webkit_web_view_get_context(c->view), a->b ?
 		    WEBKIT_TLS_ERRORS_POLICY_FAIL :
 		    WEBKIT_TLS_ERRORS_POLICY_IGNORE);
-		return; /* do not update */
+		break;
 	case Style:
 		if (a->b)
 			setstyle(c, getstyle(geturi(c)));
@@ -734,6 +791,47 @@ setparameter(Client *c, int refresh, ParamName p, const Arg *a)
 }
 
 const char *
+getcert(const char *uri)
+{
+	int i;
+
+	for (i = 0; i < LENGTH(certs); ++i) {
+		if (certs[i].regex &&
+		    !regexec(&(certs[i].re), uri, 0, NULL, 0))
+			return certs[i].file;
+	}
+
+	return NULL;
+}
+
+void
+setcert(Client *c, const char *uri)
+{
+	const char *file = getcert(uri);
+	char *host;
+	GTlsCertificate *cert;
+
+	if (!file)
+		return;
+
+	if (!(cert = g_tls_certificate_new_from_file(file, NULL))) {
+		fprintf(stderr, "Could not read certificate file: %s\n", file);
+		return;
+	}
+
+	if ((uri = strstr(uri, "https://"))) {
+		uri += sizeof("https://") - 1;
+		host = g_strndup(uri, strchr(uri, '/') - uri);
+		webkit_web_context_allow_tls_certificate_for_host(
+		    webkit_web_view_get_context(c->view), cert, host);
+		g_free(host);
+	}
+
+	g_object_unref(cert);
+
+}
+
+const char *
 getstyle(const char *uri)
 {
 	int i;
@@ -744,19 +842,19 @@ getstyle(const char *uri)
 	for (i = 0; i < LENGTH(styles); ++i) {
 		if (styles[i].regex &&
 		    !regexec(&(styles[i].re), uri, 0, NULL, 0))
-			return styles[i].style;
+			return styles[i].file;
 	}
 
 	return "";
 }
 
 void
-setstyle(Client *c, const char *stylefile)
+setstyle(Client *c, const char *file)
 {
 	gchar *style;
 
-	if (!g_file_get_contents(stylefile, &style, NULL, NULL)) {
-		fprintf(stderr, "Could not read style file: %s\n", stylefile);
+	if (!g_file_get_contents(file, &style, NULL, NULL)) {
+		fprintf(stderr, "Could not read style file: %s\n", file);
 		return;
 	}
 
@@ -813,7 +911,7 @@ newwindow(Client *c, const Arg *a, int noembed)
 {
 	int i = 0;
 	char tmp[64];
-	const char *cmd[26], *uri;
+	const char *cmd[29], *uri;
 	const Arg arg = { .v = cmd };
 
 	cmd[i++] = argv0;
@@ -823,6 +921,10 @@ newwindow(Client *c, const Arg *a, int noembed)
 	if (cookiefile && g_strcmp0(cookiefile, "")) {
 		cmd[i++] = "-c";
 		cmd[i++] = cookiefile;
+	}
+	if (stylefile && g_strcmp0(stylefile, "")) {
+		cmd[i++] = "-C";
+		cmd[i++] = stylefile;
 	}
 	cmd[i++] = curconfig[DiskCache].val.b ? "-D" : "-d";
 	if (embed && !noembed) {
@@ -842,16 +944,14 @@ newwindow(Client *c, const Arg *a, int noembed)
 		cmd[i++] = scriptfile;
 	}
 	cmd[i++] = curconfig[JavaScript].val.b ? "-S" : "-s";
-	if (stylefile && g_strcmp0(stylefile, "")) {
-		cmd[i++] = "-t";
-		cmd[i++] = stylefile;
-	}
+	cmd[i++] = curconfig[StrictTLS].val.b ? "-T" : "-t";
 	if (fulluseragent && g_strcmp0(fulluseragent, "")) {
 		cmd[i++] = "-u";
 		cmd[i++] = fulluseragent;
 	}
 	if (showxid)
-		cmd[i++] = "-x";
+		cmd[i++] = "-w";
+	cmd[i++] = curconfig[Certificate].val.b ? "-X" : "-x" ;
 	/* do not keep zoom level */
 	cmd[i++] = "--";
 	if ((uri = a->v))
@@ -900,6 +1000,7 @@ cleanup(void)
 	while (clients)
 		destroyclient(clients);
 	g_free(cookiefile);
+	g_free(historyfile);
 	g_free(scriptfile);
 	g_free(stylefile);
 	g_free(cachedir);
@@ -921,6 +1022,7 @@ newview(Client *c, WebKitWebView *rv)
 	} else {
 		settings = webkit_settings_new_with_settings(
 		   "auto-load-images", curconfig[LoadImages].val.b,
+		   "default-charset", curconfig[DefaultCharset].val.v,
 		   "default-font-size", curconfig[FontSize].val.i,
 		   "enable-caret-browsing", curconfig[CaretBrowsing].val.b,
 		   "enable-developer-extras", curconfig[Inspector].val.b,
@@ -928,13 +1030,15 @@ newview(Client *c, WebKitWebView *rv)
 		   "enable-frame-flattening", curconfig[FrameFlattening].val.b,
 		   "enable-html5-database", curconfig[DiskCache].val.b,
 		   "enable-html5-local-storage", curconfig[DiskCache].val.b,
+		   "enable-java", curconfig[Java].val.b,
 		   "enable-javascript", curconfig[JavaScript].val.b,
 		   "enable-plugins", curconfig[Plugins].val.b,
 		   "enable-accelerated-2d-canvas", curconfig[AcceleratedCanvas].val.b,
 		   "enable-site-specific-quirks", curconfig[SiteQuirks].val.b,
+		   "enable-smooth-scrolling", curconfig[SmoothScrolling].val.b,
 		   "media-playback-requires-user-gesture", curconfig[MediaManualPlay].val.b,
 		   NULL);
-/* For mor interesting settings, have a look at
+/* For more interesting settings, have a look at
  * http://webkitgtk.org/reference/webkit2gtk/stable/WebKitSettings.html */
 
 		if (strcmp(fulluseragent, "")) {
@@ -957,9 +1061,9 @@ newview(Client *c, WebKitWebView *rv)
 		 * or one for each view */
 		webkit_web_context_set_process_model(context,
 		    WEBKIT_PROCESS_MODEL_MULTIPLE_SECONDARY_PROCESSES);
-		/* ssl */
+		/* TLS */
 		webkit_web_context_set_tls_errors_policy(context,
-		    curconfig[StrictSSL].val.b ? WEBKIT_TLS_ERRORS_POLICY_FAIL :
+		    curconfig[StrictTLS].val.b ? WEBKIT_TLS_ERRORS_POLICY_FAIL :
 		    WEBKIT_TLS_ERRORS_POLICY_IGNORE);
 		/* disk cache */
 		webkit_web_context_set_cache_model(context,
@@ -1006,6 +1110,10 @@ newview(Client *c, WebKitWebView *rv)
 			 G_CALLBACK(createview), c);
 	g_signal_connect(G_OBJECT(v), "decide-policy",
 			 G_CALLBACK(decidepolicy), c);
+	g_signal_connect(G_OBJECT(v), "insecure-content-detected",
+			 G_CALLBACK(insecurecontent), c);
+	g_signal_connect(G_OBJECT(v), "load-failed-with-tls-errors",
+			 G_CALLBACK(loadfailedtls), c);
 	g_signal_connect(G_OBJECT(v), "load-changed",
 			 G_CALLBACK(loadchanged), c);
 	g_signal_connect(G_OBJECT(v), "mouse-target-changed",
@@ -1200,7 +1308,7 @@ createwindow(Client *c)
 		gtk_window_set_role(GTK_WINDOW(w), wmstr);
 		g_free(wmstr);
 
-		gtk_window_set_default_size(GTK_WINDOW(w), 800, 600);
+		gtk_window_set_default_size(GTK_WINDOW(w), winsize[0], winsize[1]);
 	}
 
 	g_signal_connect(G_OBJECT(w), "destroy",
@@ -1217,29 +1325,80 @@ createwindow(Client *c)
 	return w;
 }
 
+gboolean
+loadfailedtls(WebKitWebView *v, gchar *uri, GTlsCertificate *cert,
+              GTlsCertificateFlags err, Client *c)
+{
+	GString *errmsg = g_string_new(NULL);
+	gchar *html, *pem;
+
+	c->failedcert = g_object_ref(cert);
+	c->tlserr = err;
+	c->errorpage = 1;
+
+	if (err & G_TLS_CERTIFICATE_UNKNOWN_CA)
+		g_string_append(errmsg,
+		    "The signing certificate authority is not known.<br>");
+	if (err & G_TLS_CERTIFICATE_BAD_IDENTITY)
+		g_string_append(errmsg,
+		    "The certificate does not match the expected identity "
+		    "of the site that it was retrieved from.<br>");
+	if (err & G_TLS_CERTIFICATE_NOT_ACTIVATED)
+		g_string_append(errmsg,
+		    "The certificate's activation time "
+		    "is still in the future.<br>");
+	if (err & G_TLS_CERTIFICATE_EXPIRED)
+		g_string_append(errmsg, "The certificate has expired.<br>");
+	if (err & G_TLS_CERTIFICATE_REVOKED)
+		g_string_append(errmsg,
+		    "The certificate has been revoked according to "
+		    "the GTlsConnection's certificate revocation list.<br>");
+	if (err & G_TLS_CERTIFICATE_INSECURE)
+		g_string_append(errmsg,
+		    "The certificate's algorithm is considered insecure.<br>");
+	if (err & G_TLS_CERTIFICATE_GENERIC_ERROR)
+		g_string_append(errmsg,
+		    "Some error occurred validating the certificate.<br>");
+
+	g_object_get(cert, "certificate-pem", &pem, NULL);
+	html = g_strdup_printf("<p>Could not validate TLS for “%s”<br>%s</p>"
+	                       "<p>You can inspect the following certificate "
+	                       "with Ctrl-t (default keybinding).</p>"
+	                       "<p><pre>%s</pre></p>", uri, errmsg->str, pem);
+	g_free(pem);
+	g_string_free(errmsg, TRUE);
+
+	webkit_web_view_load_alternate_html(c->view, html, uri, NULL);
+	g_free(html);
+
+	return TRUE;
+}
+
 void
 loadchanged(WebKitWebView *v, WebKitLoadEvent e, Client *c)
 {
-	const char *title = geturi(c);
-
+	const char *uri = geturi(c);
+	FILE *f;
+		
 	switch (e) {
 	case WEBKIT_LOAD_STARTED:
-		curconfig = defconfig;
-		setatom(c, AtomUri, title);
-		c->title = title;
-		c->tlsflags = G_TLS_CERTIFICATE_VALIDATE_ALL + 1;
-		seturiparameters(c, geturi(c));
+		setatom(c, AtomUri, uri);
+		c->title = uri;
+		c->https = c->insecure = 0;
+		seturiparameters(c, uri);
+		if (c->errorpage)
+			c->errorpage = 0;
+		else
+			g_clear_object(&c->failedcert);
 		break;
 	case WEBKIT_LOAD_REDIRECTED:
-		setatom(c, AtomUri, title);
-		c->title = title;
-		seturiparameters(c, geturi(c));
+		setatom(c, AtomUri, uri);
+		c->title = uri;
+		seturiparameters(c, uri);
 		break;
 	case WEBKIT_LOAD_COMMITTED:
-		if (!webkit_web_view_get_tls_info(c->view, NULL,
-		    &(c->tlsflags)))
-			c->tlsflags = G_TLS_CERTIFICATE_VALIDATE_ALL + 1;
-
+		c->https = webkit_web_view_get_tls_info(c->view, &c->cert,
+		                                        &c->tlserr);
 		break;
 	case WEBKIT_LOAD_FINISHED:
 		/* Disabled until we write some WebKitWebExtension for
@@ -1247,6 +1406,9 @@ loadchanged(WebKitWebView *v, WebKitLoadEvent e, Client *c)
 		evalscript(c, "document.documentElement.style.overflow = '%s'",
 		    enablescrollbars ? "auto" : "hidden");
 		*/
+		f = fopen(historyfile, "a+");
+		fprintf(f, "%s\n", uri);
+		fclose(f);
 		runscript(c);
 		break;
 	}
@@ -1427,6 +1589,12 @@ decideresource(WebKitPolicyDecision *d, Client *c)
 }
 
 void
+insecurecontent(WebKitWebView *v, WebKitInsecureContentEvent e, Client *c)
+{
+	c->insecure = 1;
+}
+
+void
 downloadstarted(WebKitWebContext *wc, WebKitDownload *d, Client *c)
 {
 	g_signal_connect(G_OBJECT(d), "notify::response",
@@ -1483,6 +1651,30 @@ print(Client *c, const Arg *a)
 {
 	webkit_print_operation_run_dialog(webkit_print_operation_new(c->view),
 	                                  GTK_WINDOW(c->win));
+}
+
+void
+showcert(Client *c, const Arg *a)
+{
+	GTlsCertificate *cert = c->failedcert ? c->failedcert : c->cert;
+	GcrCertificate *gcrt;
+	GByteArray *crt;
+	GtkWidget *win;
+	GcrCertificateWidget *wcert;
+
+	if (!cert)
+		return;
+
+	g_object_get(cert, "certificate", &crt, NULL);
+	gcrt = gcr_simple_certificate_new(crt->data, crt->len);
+	g_byte_array_unref(crt);
+
+	win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+	wcert = gcr_certificate_widget_new(gcrt);
+	g_object_unref(gcrt);
+
+	gtk_container_add(GTK_CONTAINER(win), GTK_WIDGET(wcert));
+	gtk_widget_show_all(win);
 }
 
 void
@@ -1627,6 +1819,7 @@ find(Client *c, const Arg *a)
 void
 clicknavigate(Client *c, const Arg *a, WebKitHitTestResult *h)
 {
+
 	navigate(c, a);
 }
 
@@ -1634,7 +1827,6 @@ void
 clicknewwindow(Client *c, const Arg *a, WebKitHitTestResult *h)
 {
 	Arg arg;
-
 	arg.v = webkit_hit_test_result_get_link_uri(h);
 	newwindow(c, &arg, a->b);
 }
@@ -1669,6 +1861,9 @@ main(int argc, char *argv[])
 		break;
 	case 'c':
 		cookiefile = EARGF(usage());
+		break;
+	case 'C':
+		stylefile = EARGF(usage());
 		break;
 	case 'd':
 		defconfig CSETB(DiskCache, 0);
@@ -1731,16 +1926,24 @@ main(int argc, char *argv[])
 		defconfig CSETB(JavaScript, 1);
 		break;
 	case 't':
-		stylefile = EARGF(usage());
+		defconfig CSETB(StrictTLS, 0);
+		break;
+	case 'T':
+		defconfig CSETB(StrictTLS, 1);
 		break;
 	case 'u':
 		fulluseragent = EARGF(usage());
 		break;
 	case 'v':
-		die("surf-"VERSION", ©2009-2015 surf engineers, "
-		    "see LICENSE for details\n");
-	case 'x':
+		die("surf-"VERSION", see LICENSE for © details\n");
+	case 'w':
 		showxid = 1;
+		break;
+	case 'x':
+		defconfig CSETB(Certificate, 0);
+		break;
+	case 'X':
+		defconfig CSETB(Certificate, 1);
 		break;
 	case 'z':
 		defconfig CSETF(ZoomLevel, strtof(EARGF(usage()), NULL));
