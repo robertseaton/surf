@@ -302,6 +302,7 @@ setup(void)
 
 	/* dirs and files */
 	cookiefile = buildfile(cookiefile);
+	historyfile = buildfile(historyfile);
 	scriptfile = buildfile(scriptfile);
 	cachedir   = buildpath(cachedir);
 	certdir    = buildpath(certdir);
@@ -510,8 +511,8 @@ loaduri(Client *c, const Arg *a)
 	if (strcmp(url, geturi(c)) == 0) {
 		reload(c, a);
 	} else {
-		webkit_web_view_load_uri(c->view, url);
-		updatetitle(c);
+	  webkit_web_view_load_uri(c->view, url);
+	  updatetitle(c);
 	}
 
 	g_free(url);
@@ -521,7 +522,6 @@ const char *
 geturi(Client *c)
 {
 	const char *uri;
-
 	if (!(uri = webkit_web_view_get_uri(c->view)))
 		uri = "about:blank";
 	return uri;
@@ -560,7 +560,7 @@ getatom(Client *c, int a)
 void
 updatetitle(Client *c)
 {
-	char *title;
+  char *title;
 	const char *name = c->overtitle ? c->overtitle :
 	                   c->title ? c->title : "";
 
@@ -1000,6 +1000,7 @@ cleanup(void)
 	while (clients)
 		destroyclient(clients);
 	g_free(cookiefile);
+	g_free(historyfile);
 	g_free(scriptfile);
 	g_free(stylefile);
 	g_free(cachedir);
@@ -1377,7 +1378,8 @@ void
 loadchanged(WebKitWebView *v, WebKitLoadEvent e, Client *c)
 {
 	const char *uri = geturi(c);
-
+	FILE *f;
+		
 	switch (e) {
 	case WEBKIT_LOAD_STARTED:
 		setatom(c, AtomUri, uri);
@@ -1404,6 +1406,9 @@ loadchanged(WebKitWebView *v, WebKitLoadEvent e, Client *c)
 		evalscript(c, "document.documentElement.style.overflow = '%s'",
 		    enablescrollbars ? "auto" : "hidden");
 		*/
+		f = fopen(historyfile, "a+");
+		fprintf(f, "%s\n", uri);
+		fclose(f);
 		runscript(c);
 		break;
 	}
@@ -1814,6 +1819,7 @@ find(Client *c, const Arg *a)
 void
 clicknavigate(Client *c, const Arg *a, WebKitHitTestResult *h)
 {
+
 	navigate(c, a);
 }
 
@@ -1821,7 +1827,6 @@ void
 clicknewwindow(Client *c, const Arg *a, WebKitHitTestResult *h)
 {
 	Arg arg;
-
 	arg.v = webkit_hit_test_result_get_link_uri(h);
 	newwindow(c, &arg, a->b);
 }
